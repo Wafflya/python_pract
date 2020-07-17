@@ -1,0 +1,174 @@
+import pandas as pd
+import pymysql.cursors
+import csv
+import os
+from decimal import Decimal
+
+
+# Получаем айди оператора из базы, добавляя его(оператора), если нету
+def append_operator(operator_file_name):
+    with con:
+        cur = con.cursor()
+        operator_name = operator_file_name.split('.')[0]
+        # Добавляем оператора, если его нету
+        # Стоит помнить, что если оператор есть, то должна быть и колонка с его ценой.
+        cur.execute("SELECT * FROM operators where operator_name='{0}'".format(operator_name))
+        result = cur.fetchall()
+        if result == ():
+            cur.execute(
+                "insert operators (operator_name) values ('{0}') on duplicate key update operator_id=operator_id".format(
+                    operator_name))
+
+        # Добавляем колонку с ценой для оператора, если её нету
+        col_name = 'cost_' + operator_name
+        cur.execute("show columns from result;")
+        a = cur.fetchall()
+        flag = False
+        for i in a:
+            if i['Field'] == col_name:
+                flag = True
+
+        if flag == False:
+            cur.execute("ALTER TABLE result ADD {0} Decimal(5,2);".format(col_name))
+
+        # Находим id оператора
+        cur.execute("SELECT * FROM operators where operator_name='{0}'".format(operator_name))
+        id = cur.fetchall()[0]['operator_id']
+        return id
+
+
+# Тут будем парсить наш файлик и заносить данные в базу
+# Попытка написать универсальный парсер для разных форматов представления таблиц
+def parserx(file_name, sheet_name, operator_id, col_cost, *col_prefixes, col_name=None, priority=None):
+    tmpcsv = 'tmp.csv'
+    df = pd.read_excel(os.path.join(xls_folder, file_name), sheet_name)
+    df.to_csv(os.path.join(xls_folder, tmpcsv), sep=",")
+    with open(os.path.join(xls_folder, tmpcsv), encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if row[0] == '':
+                continue
+
+            # формируем префикс (нужно, если код страны и код города разделены)
+            if len(col_prefixes) == 1:
+                col_prefix = row[col_prefixes[0]]
+                pre_prefix = ''
+            elif len(col_prefixes) == 2:
+                pre_prefix = row[col_prefixes[0]]
+                col_prefix = row[col_prefixes[1]]
+                # спасибо за костыль ебанутому екселю, который читает число 840 как 840.0, сука
+                if '.' in col_prefix:
+                    col_prefix = col_prefix.split('.')[0]
+
+            # достаём цену из колонки, в которой цена, если цены нету - НУЛЛ
+            if row[col_cost] != '':
+                cost = Decimal(round(Decimal(row[col_cost]), 2))
+            else:
+                cost = 'NULL'
+
+            # Тут парсим непосредсвенно строку префиксов
+            preres_pref = []
+            if col_prefix:
+                if ':' in col_prefix:
+                    first_part = col_prefix.split(':')[0]
+                    sec_parts = col_prefix.split(':')[1].split(',')
+                    for i in sec_parts:
+                        preres_pref.append(first_part + i.strip())
+                elif '-' or '–' in col_prefix:
+                    col_prefix = col_prefix.replace('–', '-')
+                    parts = col_prefix.split(',')
+                    for i in parts:
+                        if '-' in i:
+                            for j in range(int(i.split('-')[0]), int(i.split('-')[1]) + 1):
+                                preres_pref.append(j)
+                        else:
+                            preres_pref.append(int(i))
+                else:
+                    for i in col_prefix.split(','):
+                        preres_pref.append(int(i))
+
+            res_pref = []
+            if len(preres_pref) == 0:
+                res_pref.append(int(pre_prefix))
+            else:
+                for i in preres_pref:
+                    res_pref.append(int(pre_prefix + str(i)))
+
+            # Пишем в основную табличку (оператор_ид - цена - стоимость)
+            with con:
+                cur = con.cursor()
+                cur.execute("SELECT operator_name as name FROM operators where operator_id={0};".format(
+                    operator_id))
+                op_name = cur.fetchall()[0]['name']
+                op_name_cost_col = 'cost_' + op_name
+            for pref in res_pref:
+                with con:
+                    cur = con.cursor()
+
+                    # Добавляем в таблицу для связей/промежуточную таблицу
+                    cur.execute(
+                        "insert prefix_cost (operator_id, prefix, cost) values ({0}, {1}, {2}) on duplicate key "
+                        "update cost={2}".format(
+                            operator_id, int(pref), cost))
+
+                    # Добавляем название регионов по префиксу с приоретизацией названий
+                    if col_name is not None:
+                        reg_name = str(row[col_name]).strip()
+                        cur.execute("SELECT * FROM prefix_region where prefix={0}".format(int(pref)))
+                        if cur.fetchall() == () or priority == 1:
+                            cur.execute(
+                                "insert prefix_region (region_name, prefix) values ('{0}', {1}) on duplicate key "
+                                "update region_name='{0}'".format(
+                                    reg_name, int(pref)))
+
+
+                    # Добавляем в результурующую табличку
+                    cur.execute(
+                        "insert result (prefix, {0}) values ({1}, {2}) on duplicate key update {0}={2}".format(
+                            op_name_cost_col, int(pref), cost))
+
+    os.remove(os.path.join(xls_folder, tmpcsv))
+
+
+# Инициализируем файловую систему
+# В директории 'files' будут лежать файлики xls/xlsx
+script_folder = os.path.dirname(__file__)
+xls_folder = os.path.join(script_folder, 'files')
+
+# Открываем базу для работы с ней, инициализируем "курсор"
+con = pymysql.connect('домен', 'имя пользователя',
+                     'пароль', 'название таблицы', cursorclass=pymysql.cursors.DictCursor)
+#con = pymysql.connect('localhost', 'root',
+#                    'password', 'prefixes', cursorclass=pymysql.cursors.DictCursor)
+
+
+# Получаем список ексель-файликов с инфой
+operator_files = []
+for i in os.listdir(xls_folder):
+    if i.split('.')[1] in 'xlsx':
+        operator_files.append(i)
+
+# Для каждого файлика записываем данные в базу, где:
+# имя файла без расширения - имя оператора
+for op_name_file in operator_files:
+    # получаем ид оператора из базы
+    op_id = append_operator(op_name_file)
+
+    # получаем список листов для хлс-файла оператора
+    sheet_list = []
+    for i in pd.read_excel(os.path.join(xls_folder, op_name_file), None):
+        sheet_list.append(i)
+
+    # предполагаем от какого оператора файлик и парсим, т.к.
+    # у них разный порядок колонок немного
+    if 'MTC' in op_name_file:
+        for i in sheet_list:
+            if 'МГ' in i:
+                parserx(op_name_file, i, op_id, 3, 2, col_name=1)
+            elif 'МН' in i:
+                parserx(op_name_file, i, op_id, 4, 2, 3, col_name=1)
+    if 'fon' in op_name_file:
+        for i in sheet_list:
+            parserx(op_name_file, i, op_id, 3, 1, col_name=2, priority=1)
+
+#  Единственное, из файлов нужно удалять всё что идёт после последней записи направления-цены
